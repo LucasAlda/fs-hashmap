@@ -1,53 +1,26 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"math/rand"
-	"time"
 
-	"github.com/streadway/amqp"
+	"math/rand"
+
+	"github.com/LucasAlda/demo-falopa/middleware"
 )
 
-const CANT_REVIEWS = 10_000_000
+const CANT_REVIEWS = 3_000_000
+
 const CANT_GAMES = 10_000
 
 func main() {
-	// ch := make(chan Game)
-
-	// stats := make(chan int)
-	// go seedDB(ch)
-	// go writeStats(stats)
-	// processGames(ch, stats)
-
-	conn, err := amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-
-	ch, err := conn.Channel()
-	if err != nil {
-		panic(err)
-	}
-	defer ch.Close()
-
-	err = ch.ExchangeDeclare(
-		"games", // name
-		"topic", // type
-		true,    // durable
-		false,   // delete when unused
-		false,   // internal
-		false,   // no-wait
-		nil,     // arguments
-	)
+	middleware, err := middleware.NewMiddleware()
 	if err != nil {
 		panic(err)
 	}
 
-	time.Sleep(3 * time.Second)
+	defer middleware.Close()
 
-	seedDB(ch)
+	seedDB(middleware)
 }
 
 type Game struct {
@@ -56,61 +29,33 @@ type Game struct {
 	Last  bool `json:"last"`
 }
 
-func seedDB(ch *amqp.Channel) error {
+func seedDB(m *middleware.Middleware) error {
 
 	for i := 0; i < CANT_REVIEWS; i++ {
 		if i%25_000 == 0 {
 			fmt.Printf("Seeding %d reviews\n", i)
 		}
 
-		appId := rand.Intn(CANT_GAMES)
-		body := Game{
-			AppId: appId,
-			Score: 1,
-			Last:  false,
-		}
-		bodyBytes, err := json.Marshal(body)
-		if err != nil {
-			return err
+		body := middleware.StatsMsg{
+			Stats: &middleware.Stats{
+				AppId:     rand.Intn(CANT_GAMES),
+				Name:      "Really Long Game Name here 2077: Deluxe Edition",
+				Text:      "This is a review text",
+				Genres:    []string{"Action", "Adventure"},
+				Positives: 1,
+				Negatives: 1,
+			},
 		}
 
-		topic := appId % 3
-
-		err = ch.Publish(
-			"games",                       // exchange
-			fmt.Sprintf("game.%d", topic), // routing key
-			false,                         // mandatory
-			false,                         // immediate
-			amqp.Publishing{
-				ContentType: "text/plain",
-				Body:        bodyBytes,
-			})
+		err := m.SendStats(&body)
 		if err != nil {
 			return err
 		}
 	}
 
 	for i := 0; i < 3; i++ {
-		body := Game{
-			AppId: -1,
-			Score: 0,
-			Last:  true,
-		}
 
-		bodyBytes, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-
-		err = ch.Publish(
-			"games",                   // exchange
-			fmt.Sprintf("game.%d", i), // routing key
-			false,                     // mandatory
-			false,                     // immediate
-			amqp.Publishing{
-				ContentType: "text/plain",
-				Body:        bodyBytes,
-			})
+		err := m.SendStatsFinished()
 		if err != nil {
 			return err
 		}

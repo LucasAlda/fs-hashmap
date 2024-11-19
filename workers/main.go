@@ -1,72 +1,32 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/streadway/amqp"
+	"github.com/LucasAlda/demo-falopa/middleware"
 )
 
-const demo = "REVIEW"
+// const demo = "REVIEW"
 
 func main() {
-	id := os.Getenv("ID")
-
-	os.Mkdir("./database", 0755)
-	conn, err := amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
+	middleware, err := middleware.NewMiddleware()
 	if err != nil {
 		panic(err)
 	}
-	defer conn.Close()
+	defer middleware.Close()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		panic(err)
-	}
-	defer ch.Close()
-
-	ch.ExchangeDeclare(
-		"games", // name
-		"topic", // type
-		true,    // durable
-		false,   // delete when unused
-		false,   // internal
-		false,   // no-wait
-		nil,     // arguments
-	)
-
-	queue, err := ch.QueueDeclare(
-		"",    // name
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-
-	ch.QueueBind(
-		queue.Name,                 // queue name
-		fmt.Sprintf("game.%s", id), // routing key
-		"games",                    // exchange
-		false,                      // no-wait
-		nil,                        // arguments
-	)
-
-	if err != nil {
-		panic(err)
-	}
+	os.Mkdir("./database", 0777)
 
 	stats := make(chan int)
 	go writeStats(stats)
 
-	processGames(ch, &queue, stats)
+	processGames(middleware, stats)
 
 	validate()
 
@@ -99,163 +59,84 @@ func writeStats(stats <-chan int) error {
 	return nil
 }
 
-func updater(msgs <-chan amqp.Delivery, stats chan<- int) error {
-	i := 0
+func updateGame(game *middleware.Stats) error {
+	os.MkdirAll("./database/cliente", 0777)
+	file, err := os.Open(fmt.Sprintf("./database/cliente/%d.csv", game.AppId))
+	if err == nil {
+		reader := csv.NewReader(file)
 
-	for msg := range msgs {
-		game := Game{}
-		err := json.Unmarshal(msg.Body, &game)
+		record, err := reader.Read()
+		if err != nil && err != io.EOF {
+			log.Fatalf("failed to read line: %v", err)
+		}
+
+		positives, err := strconv.Atoi(record[2])
 		if err != nil {
-			log.Fatalf("failed to unmarshal game: %v", err)
+			log.Fatalf("failed to convert positives to int: %v", err)
 		}
 
-		if game.Last {
-			break
+		negatives, err := strconv.Atoi(record[3])
+		if err != nil {
+			log.Fatalf("failed to convert negatives to int: %v", err)
 		}
 
+		game.Positives += positives
+		game.Negatives += negatives
+
+		_, err = file.Seek(0, 0)
+		if err != nil {
+			log.Fatalf("failed to seek to start of file: %v", err)
+		}
+	}
+	defer file.Close()
+
+	tmp, err := os.CreateTemp("./database", "*.csv")
+	if err != nil {
+		log.Fatalf("failed to create temp file: %v", err)
+	}
+
+	writer := csv.NewWriter(tmp)
+
+	err = writer.Write([]string{strconv.Itoa(game.AppId), game.Name, strconv.Itoa(game.Positives), strconv.Itoa(game.Negatives)})
+	if err != nil {
+		log.Fatalf("failed to write to file: %v", err)
+	}
+
+	writer.Flush()
+
+	err = os.Rename(tmp.Name(), fmt.Sprintf("./database/cliente/%d.csv", game.AppId))
+	if err != nil {
+		log.Fatalf("failed to rename file: %v", err)
+	}
+
+	return nil
+}
+
+func processGames(m *middleware.Middleware, stats chan<- int) error {
+	queue, err := m.ListenStats(os.Getenv("ID"), "Action")
+	if err != nil {
+		return err
+	}
+
+	i := 0
+	queue.Consume(func(message *middleware.StatsMsg, ack func()) error {
 		i++
 		if i > 10000 && i > 0 {
 			stats <- i
 			i = 0
 		}
 
-		if demo == "GAME" {
-			updateGameOnce(game)
-		} else {
-			updateGame(game)
-		}
-
-		msg.Ack(false)
-
-	}
-
-	return nil
-}
-
-func updateGame(game Game) error {
-	file, err := os.OpenFile(fmt.Sprintf("./database/%d.csv", game.AppId), os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("failed to open file: %v", err)
-	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil {
-		log.Fatalf("failed to get file stat: %v", err)
-	}
-
-	if stat.Size() > 0 {
-		reader := bufio.NewReader(file)
-
-		line, _, err := reader.ReadLine()
-		if err != nil && err != io.EOF {
-			log.Fatalf("failed to read line: %v", err)
-		}
-
-		parts := strings.Split(string(line), ",")
-		score, err := strconv.Atoi(parts[1])
-		if err != nil {
-			log.Fatalf("failed to convert score to int: %v", err)
-		}
-
-		game.Score += score
-	}
-
-	if err != nil {
-		log.Fatalf("failed to create temp file: %v", err)
-	}
-	writer := bufio.NewWriter(file)
-
-	_, err = file.Seek(0, 0)
-	if err != nil {
-		log.Fatalf("failed to seek to start of file: %v", err)
-	}
-
-	_, err = writer.WriteString(fmt.Sprintf("%d,%d\n", game.AppId, game.Score))
-	if err != nil {
-		log.Fatalf("failed to write to file: %v", err)
-	}
-
-	if err := writer.Flush(); err != nil {
-		log.Fatalf("failed to flush writer: %v", err)
-	}
-
-	return nil
-}
-
-func updateGameOnce(game Game) error {
-	file, err := os.OpenFile(fmt.Sprintf("./database/%d.csv", game.AppId), os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("failed to open file: %v", err)
-	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil {
-		log.Fatalf("failed to get file stat: %v", err)
-	}
-
-	if stat.Size() > 0 {
-		reader := bufio.NewReader(file)
-
-		line, _, err := reader.ReadLine()
-		if err != nil && err != io.EOF {
-			log.Fatalf("failed to read line: %v", err)
-		}
-
-		parts := strings.Split(string(line), ",")
-		score, err := strconv.Atoi(parts[1])
-		if err != nil {
-			log.Fatalf("failed to convert score to int: %v", err)
-		}
-
-		game.Score += score
+		updateGame(message.Stats)
+		ack()
 		return nil
-	}
-
-	if err != nil {
-		log.Fatalf("failed to create temp file: %v", err)
-	}
-	writer := bufio.NewWriter(file)
-
-	_, err = file.Seek(0, 0)
-	if err != nil {
-		log.Fatalf("failed to seek to start of file: %v", err)
-	}
-
-	_, err = writer.WriteString(fmt.Sprintf("%d,%d\n", game.AppId, game.Score))
-	if err != nil {
-		log.Fatalf("failed to write to file: %v", err)
-	}
-
-	if err := writer.Flush(); err != nil {
-		log.Fatalf("failed to flush writer: %v", err)
-	}
-
-	return nil
-}
-
-func processGames(ch *amqp.Channel, queue *amqp.Queue, stats chan<- int) error {
-	msgs, err := ch.Consume(
-		queue.Name, // queue
-		"",         // consumer
-		false,      // auto-ack
-		false,      // exclusive
-		false,      // no-local
-		false,      // no-wait
-		nil,        // args
-	)
-	if err != nil {
-		return err
-	}
-
-	updater(msgs, stats)
+	})
 
 	return nil
 }
 
 func validate() error {
-	counter := make(chan int)
+	positivesCounter := make(chan int)
+	negativesCounter := make(chan int)
 
 	go func() {
 		id, err := strconv.Atoi(os.Getenv("ID"))
@@ -264,36 +145,48 @@ func validate() error {
 		}
 
 		for i := id; i < 10_000; i += 3 {
-
-			file, err := os.Open(fmt.Sprintf("./database/%d.csv", i))
+			file, err := os.Open(fmt.Sprintf("./database/cliente/%d.csv", i))
 			if err != nil {
 				log.Fatalf("failed to open file: %v", err)
 			}
 
-			reader := bufio.NewReader(file)
+			reader := csv.NewReader(file)
 
-			line, _, err := reader.ReadLine()
+			record, err := reader.Read()
 			if err != nil && err != io.EOF {
 				log.Fatalf("failed to read line: %v", err)
 			}
 
-			parts := strings.Split(string(line), ",")
-			score, err := strconv.Atoi(parts[1])
+			positives, err := strconv.Atoi(record[2])
 			if err != nil {
-				log.Fatalf("failed to convert score to int: %v", err)
+				log.Fatalf("failed to convert positives to int: %v", err)
 			}
 
-			counter <- score
+			negatives, err := strconv.Atoi(record[3])
+			if err != nil {
+				log.Fatalf("failed to convert negatives to int: %v", err)
+			}
+
+			positivesCounter <- positives
+			negativesCounter <- negatives
 		}
 
-		close(counter)
+		close(positivesCounter)
+		close(negativesCounter)
 	}()
 
-	total := 0
-	for score := range counter {
-		total += score
+	totalPositives := 0
+	for positives := range positivesCounter {
+		totalPositives += positives
 	}
-	fmt.Printf("Total Validated: %d\n", total)
+
+	totalNegatives := 0
+	for negatives := range negativesCounter {
+		totalNegatives += negatives
+	}
+	fmt.Printf("Total Validated: %d\n", totalPositives+totalNegatives)
+	fmt.Printf("Total Positives: %d\n", totalPositives)
+	fmt.Printf("Total Negatives: %d\n", totalNegatives)
 
 	return nil
 }

@@ -1,16 +1,8 @@
 name: demo-falopa
 
 services:
-  # demo-falopa:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   deploy:
-  #     replicas: 2
-
   rabbitmq:
     image: rabbitmq:4-management
-    container_name: rabbitmq
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -24,21 +16,22 @@ services:
       RABBITMQ_DEFAULT_LOG_LEVEL: error
       RABBITMQ_LOG_LEVELS: "connection=error"
 
-  # seeder:
-  #   image: seeder:latest
-  #   depends_on:
-  #     rabbitmq:
-  #       condition: service_healthy
+  seeder:
+    image: seeder:latest
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
-  # demo-falopa-1:
-  #   image: workers:latest
-  #   depends_on:
-  #     rabbitmq:
-  #       condition: service_healthy
-  #   environment:
-  #     ID: 0
-  #   # volumes:
-  #   #   - ./database:/app/database
+  demo-falopa-1:
+    image: workers:latest
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      ID: 0
+    volumes:
+      - ../database-falopa:/app/database
+
   # demo-falopa-2:
   #   image: workers:latest
   #   depends_on:
@@ -46,8 +39,7 @@ services:
   #       condition: service_healthy
   #   environment:
   #     ID: 1
-  #   # volumes:
-  #   #   - ./database:/app/database
+
   # demo-falopa-3:
   #   image: workers:latest
   #   depends_on:
@@ -55,15 +47,3 @@ services:
   #       condition: service_healthy
   #   environment:
   #     ID: 2
-    # volumes:
-    #   - ./database:/app/database
- 
-  # validate:
-  #   build:
-  #     context: ./
-  #     dockerfile: ./validate/Dockerfile
-  #   # deploy:
-  #     # mode: replicated
-  #     # replicas: 3
-  #   volumes:
-  #     - ./database:/app/database
