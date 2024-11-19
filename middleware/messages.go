@@ -128,6 +128,7 @@ func NewStats(game []string, review *Review) *Stats {
 }
 
 type StatsMsg struct {
+	Id    int
 	Stats *Stats
 	Last  bool
 }

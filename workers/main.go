@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -23,14 +24,10 @@ func main() {
 
 	os.Mkdir("./database", 0777)
 
-	stats := make(chan int)
-	go writeStats(stats)
+	metrics := make(chan int)
+	go writeMetrics(metrics)
 
-	processGames(middleware, stats)
-
-	validate()
-
-	// time.Sleep(10000 * time.Second)
+	processStats(middleware, metrics)
 }
 
 type Game struct {
@@ -39,14 +36,25 @@ type Game struct {
 	Last  bool `json:"last"`
 }
 
-func writeStats(stats <-chan int) error {
+func writeMetrics(metrics <-chan int) error {
 	i := 0
 	lastTime := time.Now()
 	lastLog := 0
 
-	for stat := range stats {
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			fmt.Printf("Stats: %d\n", i)
+		}
+	}()
+
+	for stat := range metrics {
+		if i == 0 {
+			lastTime = time.Now()
+		}
+
 		i += stat
-		if (i-lastLog) > 50_000 && i > 1000 {
+		if (i-lastLog) >= 10_000 && i > 1000 {
 			now := time.Now()
 			diff := now.Sub(lastTime).Milliseconds()
 			if diff > 0 {
@@ -59,134 +67,237 @@ func writeStats(stats <-chan int) error {
 	return nil
 }
 
-func updateGame(game *middleware.Stats) error {
-	os.MkdirAll("./database/cliente", 0777)
-	file, err := os.Open(fmt.Sprintf("./database/cliente/%d.csv", game.AppId))
+func updateStat(stat *middleware.Stats, tmpFile *os.File) {
+	file, err := os.Open(fmt.Sprintf("./database/%d/stat.csv", stat.AppId))
 	if err == nil {
 		reader := csv.NewReader(file)
 
 		record, err := reader.Read()
 		if err != nil && err != io.EOF {
-			log.Fatalf("failed to read line: %v", err)
+			log.Printf("failed to read line: %v", err)
+			return
 		}
 
 		positives, err := strconv.Atoi(record[2])
 		if err != nil {
-			log.Fatalf("failed to convert positives to int: %v", err)
+			log.Printf("failed to convert positives to int: %v", err)
+			return
 		}
 
 		negatives, err := strconv.Atoi(record[3])
 		if err != nil {
-			log.Fatalf("failed to convert negatives to int: %v", err)
+			log.Printf("failed to convert negatives to int: %v", err)
+			return
 		}
 
-		game.Positives += positives
-		game.Negatives += negatives
+		stat.Positives += positives
+		stat.Negatives += negatives
 
 		_, err = file.Seek(0, 0)
 		if err != nil {
-			log.Fatalf("failed to seek to start of file: %v", err)
+			log.Printf("failed to seek to start of file: %v", err)
+			return
 		}
 	}
 	defer file.Close()
 
-	tmp, err := os.CreateTemp("./database", "*.csv")
-	if err != nil {
-		log.Fatalf("failed to create temp file: %v", err)
-	}
+	writer := csv.NewWriter(tmpFile)
 
-	writer := csv.NewWriter(tmp)
-
-	err = writer.Write([]string{strconv.Itoa(game.AppId), game.Name, strconv.Itoa(game.Positives), strconv.Itoa(game.Negatives)})
+	err = writer.Write([]string{strconv.Itoa(stat.AppId), stat.Name, strconv.Itoa(stat.Positives), strconv.Itoa(stat.Negatives)})
 	if err != nil {
-		log.Fatalf("failed to write to file: %v", err)
+		log.Printf("failed to write to file: %v", err)
+		return
 	}
 
 	writer.Flush()
-
-	err = os.Rename(tmp.Name(), fmt.Sprintf("./database/cliente/%d.csv", game.AppId))
-	if err != nil {
-		log.Fatalf("failed to rename file: %v", err)
-	}
-
-	return nil
 }
 
-func processGames(m *middleware.Middleware, stats chan<- int) error {
+func updateProcessed(id int) {
+
+	file, err := os.OpenFile("./database/processed.bin", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0777)
+	if err != nil {
+		return
+	}
+
+	defer file.Close()
+
+	err = binary.Write(file, binary.BigEndian, int32(id))
+	if err != nil {
+		log.Printf("failed to write to file: %v", err)
+		return
+	}
+
+}
+
+func getAlreadyProcessed() map[int]bool {
+	alreadyProcessed := make(map[int]bool)
+	file, err := os.Open("./database/processed.bin")
+	if err != nil {
+		return alreadyProcessed
+	}
+
+	defer file.Close()
+
+	var current int32
+
+	for {
+		err := binary.Read(file, binary.BigEndian, &current)
+		if err == io.EOF {
+			break
+		}
+
+		alreadyProcessed[int(current)] = true
+	}
+
+	return alreadyProcessed
+}
+
+func processStats(m *middleware.Middleware, metrics chan<- int) error {
+	alreadyProcessed := getAlreadyProcessed()
+
+	RestoreCommits(func(commit *Commit) {
+		log.Printf("Restoring stat...")
+
+		err := os.Rename(commit.data[0][2], fmt.Sprintf("./database/%s/stat.csv", commit.data[0][0]))
+
+		if err != nil {
+			log.Printf("failed to rename file: %v", err)
+			return
+		}
+
+		id, err := strconv.Atoi(commit.data[0][1])
+		if err != nil {
+			log.Printf("failed to convert id to int: %v", err)
+			return
+		}
+
+		alreadyProcessed[id] = true
+		commit.end()
+	})
+
 	queue, err := m.ListenStats(os.Getenv("ID"), "Action")
 	if err != nil {
 		return err
 	}
 
-	i := 0
+	log.Printf("Listening stats")
+
 	queue.Consume(func(message *middleware.StatsMsg, ack func()) error {
-		i++
-		if i > 10000 && i > 0 {
-			stats <- i
-			i = 0
+		metrics <- 1
+
+		os.MkdirAll(fmt.Sprintf("./database/%d", message.Stats.AppId), 0777)
+
+		if alreadyProcessed[message.Id] {
+			ack()
+			return nil
 		}
 
-		updateGame(message.Stats)
+		tmpFile, err := os.CreateTemp(fmt.Sprintf("./database/%d", message.Stats.AppId), "stat.csv")
+		if err != nil {
+			log.Printf("failed to create temp file: %v", err)
+			return nil
+		}
+
+		data := [][]string{
+			{strconv.Itoa(message.Stats.AppId), strconv.Itoa(message.Id), tmpFile.Name()},
+		}
+
+		commit := NewCommit(fmt.Sprintf("%d", message.Stats.AppId), data)
+
+		updateStat(message.Stats, tmpFile)
+		updateProcessed(message.Id)
+		alreadyProcessed[message.Id] = true
+
+		os.Rename(tmpFile.Name(), fmt.Sprintf("./database/%d/stat.csv", message.Stats.AppId))
+
+		commit.end()
+
 		ack()
+
 		return nil
 	})
 
 	return nil
 }
 
-func validate() error {
-	positivesCounter := make(chan int)
-	negativesCounter := make(chan int)
+type Commit struct {
+	path   string
+	commit *os.File
+	data   [][]string
+}
 
-	go func() {
-		id, err := strconv.Atoi(os.Getenv("ID"))
-		if err != nil {
-			log.Fatalf("failed to convert ID to int: %v", err)
-		}
+// data: [[filename, tmpFilename],[filename, tmpFilename],[key,value]]
 
-		for i := id; i < 10_000; i += 3 {
-			file, err := os.Open(fmt.Sprintf("./database/cliente/%d.csv", i))
-			if err != nil {
-				log.Fatalf("failed to open file: %v", err)
-			}
-
-			reader := csv.NewReader(file)
-
-			record, err := reader.Read()
-			if err != nil && err != io.EOF {
-				log.Fatalf("failed to read line: %v", err)
-			}
-
-			positives, err := strconv.Atoi(record[2])
-			if err != nil {
-				log.Fatalf("failed to convert positives to int: %v", err)
-			}
-
-			negatives, err := strconv.Atoi(record[3])
-			if err != nil {
-				log.Fatalf("failed to convert negatives to int: %v", err)
-			}
-
-			positivesCounter <- positives
-			negativesCounter <- negatives
-		}
-
-		close(positivesCounter)
-		close(negativesCounter)
-	}()
-
-	totalPositives := 0
-	for positives := range positivesCounter {
-		totalPositives += positives
+// commitFile:
+// filename,tmpFilename
+// filename,tmpFilename
+// key,value
+// END
+func NewCommit(path string, data [][]string) *Commit {
+	os.MkdirAll("./database/commit", 0777)
+	os.MkdirAll(fmt.Sprintf("./database/%s", path), 0777)
+	commit, err := os.Create(fmt.Sprintf("./database/commit/%s.csv", path))
+	if err != nil {
+		log.Printf("failed to create commit file: %v", err)
+		return nil
 	}
 
-	totalNegatives := 0
-	for negatives := range negativesCounter {
-		totalNegatives += negatives
-	}
-	fmt.Printf("Total Validated: %d\n", totalPositives+totalNegatives)
-	fmt.Printf("Total Positives: %d\n", totalPositives)
-	fmt.Printf("Total Negatives: %d\n", totalNegatives)
+	writer := csv.NewWriter(commit)
+	writer.WriteAll(data)
+	writer.Write([]string{"END"})
+	writer.Flush()
 
-	return nil
+	return &Commit{path: path, commit: commit, data: data}
+}
+
+func RestoreCommits(onCommit func(commit *Commit)) {
+	files, err := os.ReadDir("./database/commit/")
+	if err != nil {
+		return
+	}
+
+	for _, file := range files {
+		restoreCommit(file.Name(), onCommit)
+	}
+}
+
+func restoreCommit(path string, onCommit func(commit *Commit)) {
+	log.Printf("Restore commit: %s", path)
+	commitFile, err := os.Open(fmt.Sprintf("./database/commit/%s", path))
+	if err != nil {
+		log.Printf("failed to open commit file: %v", err)
+		return
+	}
+
+	reader := csv.NewReader(commitFile)
+	reader.FieldsPerRecord = -1
+
+	data, err := reader.ReadAll()
+	if err != nil {
+		log.Printf("failed to read commit file: %v", err)
+		return
+	}
+
+	if len(data) == 0 {
+		log.Printf("empty commit file: %s", path)
+		return
+	}
+
+	if len(data[len(data)-1]) == 0 {
+		log.Printf("empty commit file (2): %s", path)
+		return
+	}
+
+	if data[len(data)-1][0] == "END" {
+		log.Printf("empty commit file (3): %s", path)
+		return
+	}
+
+	commit := &Commit{path: path, commit: commitFile, data: data[:len(data)-1]}
+
+	onCommit(commit)
+}
+
+func (c *Commit) end() {
+	os.Remove(c.commit.Name())
 }

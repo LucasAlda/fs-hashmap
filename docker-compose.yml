@@ -28,9 +28,10 @@ services:
       rabbitmq:
         condition: service_healthy
     environment:
-      ID: 0
+      ID: 1
     volumes:
       - ../database-falopa:/app/database
+    restart: always
 
   # demo-falopa-2:
   #   image: workers:latest

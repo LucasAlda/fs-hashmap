@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func (m *Middleware) declare() error {
@@ -272,7 +272,7 @@ func (m *Middleware) SendStats(message *StatsMsg) error {
 	// 	int, _ := strconv.Atoi(string(char))
 	// 	totalInt += int
 	// }
-	shardId := 0
+	shardId := 1
 	topic := strconv.Itoa(shardId) + "." + strings.Join(message.Stats.Genres, ".")
 
 	return m.publishExchange("stats", topic, message)
@@ -319,12 +319,6 @@ func (sq *StatsQueue) Consume(callback func(message *StatsMsg, ack func()) error
 		if err != nil {
 			log.Fatalf("Failed to decode message: %v", err)
 			continue
-		}
-
-		if res.Last {
-			log.Println("Last stats received, sending to reducer")
-			msg.Ack(false)
-			break
 		}
 
 		callback(&res, func() {

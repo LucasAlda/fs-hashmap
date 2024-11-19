@@ -5,7 +5,7 @@ import (
 	"encoding/gob"
 	"log"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type Middleware struct {
@@ -108,12 +108,14 @@ func (m *Middleware) consumeQueue(q *amqp.Queue) (<-chan amqp.Delivery, error) {
 
 func (m *Middleware) bindExchange(exchange string, key string) (*amqp.Queue, error) {
 	q, err := m.channel.QueueDeclare(
-		"",    // name
-		false, // durable
+		key,   // name
+		true,  // durable
 		false, // delete when unused
-		true,  // exclusive
+		false, // exclusive
 		false, // no-wait
-		nil,   // arguments
+		amqp.Table{
+			amqp.ConsumerTimeoutArg: 5000,
+		}, // arguments
 	)
 	if err != nil {
 		log.Fatalf("Failed to declare queue: %v", err)
