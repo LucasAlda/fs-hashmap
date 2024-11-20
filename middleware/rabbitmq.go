@@ -114,7 +114,7 @@ func (m *Middleware) bindExchange(exchange string, key string) (*amqp.Queue, err
 		false, // exclusive
 		false, // no-wait
 		amqp.Table{
-			amqp.ConsumerTimeoutArg: 5000,
+			amqp.ConsumerTimeoutArg: 60 * 1000,
 		}, // arguments
 	)
 	if err != nil {

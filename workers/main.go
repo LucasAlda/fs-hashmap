@@ -15,6 +15,8 @@ import (
 
 // const demo = "REVIEW"
 
+var statsCache = make(map[int]middleware.Stats)
+
 func main() {
 	middleware, err := middleware.NewMiddleware()
 	if err != nil {
@@ -68,48 +70,49 @@ func writeMetrics(metrics <-chan int) error {
 }
 
 func updateStat(stat *middleware.Stats, tmpFile *os.File) {
-	file, err := os.Open(fmt.Sprintf("./database/%d/stat.csv", stat.AppId))
-	if err == nil {
-		reader := csv.NewReader(file)
+	if cached, ok := statsCache[stat.AppId]; ok {
+		stat.Negatives += cached.Negatives
+		stat.Positives += cached.Positives
+	} else {
+		file, err := os.Open(fmt.Sprintf("./database/%d/stat.csv", stat.AppId))
+		if err == nil {
+			reader := csv.NewReader(file)
 
-		record, err := reader.Read()
-		if err != nil && err != io.EOF {
-			log.Printf("failed to read line: %v", err)
-			return
+			record, err := reader.Read()
+			if err != nil && err != io.EOF {
+				log.Printf("failed to read line: %v", err)
+				return
+			}
+
+			positives, err := strconv.Atoi(record[2])
+			if err != nil {
+				log.Printf("failed to convert positives to int: %v", err)
+				return
+			}
+
+			negatives, err := strconv.Atoi(record[3])
+			if err != nil {
+				log.Printf("failed to convert negatives to int: %v", err)
+				return
+			}
+
+			stat.Positives += positives
+			stat.Negatives += negatives
 		}
 
-		positives, err := strconv.Atoi(record[2])
-		if err != nil {
-			log.Printf("failed to convert positives to int: %v", err)
-			return
-		}
-
-		negatives, err := strconv.Atoi(record[3])
-		if err != nil {
-			log.Printf("failed to convert negatives to int: %v", err)
-			return
-		}
-
-		stat.Positives += positives
-		stat.Negatives += negatives
-
-		_, err = file.Seek(0, 0)
-		if err != nil {
-			log.Printf("failed to seek to start of file: %v", err)
-			return
-		}
+		file.Close()
 	}
-	defer file.Close()
 
 	writer := csv.NewWriter(tmpFile)
 
-	err = writer.Write([]string{strconv.Itoa(stat.AppId), stat.Name, strconv.Itoa(stat.Positives), strconv.Itoa(stat.Negatives)})
+	err := writer.Write([]string{strconv.Itoa(stat.AppId), stat.Name, strconv.Itoa(stat.Positives), strconv.Itoa(stat.Negatives)})
 	if err != nil {
 		log.Printf("failed to write to file: %v", err)
 		return
 	}
 
 	writer.Flush()
+	statsCache[stat.AppId] = *stat
 }
 
 func updateProcessed(id int) {
@@ -156,7 +159,7 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 	alreadyProcessed := getAlreadyProcessed()
 
 	RestoreCommits(func(commit *Commit) {
-		log.Printf("Restoring stat...")
+		log.Printf("Restoring stat id: %s", commit.data[0][1])
 
 		err := os.Rename(commit.data[0][2], fmt.Sprintf("./database/%s/stat.csv", commit.data[0][0]))
 
@@ -171,7 +174,14 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 			return
 		}
 
+		if alreadyProcessed[id] {
+			commit.end()
+			return
+		}
+
+		updateProcessed(id)
 		alreadyProcessed[id] = true
+
 		commit.end()
 	})
 
@@ -182,7 +192,22 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 
 	log.Printf("Listening stats")
 
+	finished := false
+
 	queue.Consume(func(message *middleware.StatsMsg, ack func()) error {
+
+		if finished {
+			log.Printf("New messages when already finished :(")
+			return nil
+		}
+
+		if message.Last {
+			finished = true
+			log.Printf("Last message received")
+			ack()
+			return nil
+		}
+
 		metrics <- 1
 
 		os.MkdirAll(fmt.Sprintf("./database/%d", message.Stats.AppId), 0777)
@@ -202,9 +227,10 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 			{strconv.Itoa(message.Stats.AppId), strconv.Itoa(message.Id), tmpFile.Name()},
 		}
 
+		updateStat(message.Stats, tmpFile)
+
 		commit := NewCommit(fmt.Sprintf("%d", message.Stats.AppId), data)
 
-		updateStat(message.Stats, tmpFile)
 		updateProcessed(message.Id)
 		alreadyProcessed[message.Id] = true
 
@@ -235,7 +261,7 @@ type Commit struct {
 // END
 func NewCommit(path string, data [][]string) *Commit {
 	os.MkdirAll("./database/commit", 0777)
-	os.MkdirAll(fmt.Sprintf("./database/%s", path), 0777)
+	// os.MkdirAll(fmt.Sprintf("./database/%s", path), 0777)
 	commit, err := os.Create(fmt.Sprintf("./database/commit/%s.csv", path))
 	if err != nil {
 		log.Printf("failed to create commit file: %v", err)
@@ -257,6 +283,16 @@ func RestoreCommits(onCommit func(commit *Commit)) {
 	}
 
 	for _, file := range files {
+		info, err := file.Info()
+		if err != nil {
+			log.Printf("failed to get file info: %v", err)
+			continue
+		}
+
+		if info.Size() == 0 {
+			continue
+		}
+
 		restoreCommit(file.Name(), onCommit)
 	}
 }
@@ -288,7 +324,7 @@ func restoreCommit(path string, onCommit func(commit *Commit)) {
 		return
 	}
 
-	if data[len(data)-1][0] == "END" {
+	if data[len(data)-1][0] != "END" {
 		log.Printf("empty commit file (3): %s", path)
 		return
 	}
@@ -299,5 +335,6 @@ func restoreCommit(path string, onCommit func(commit *Commit)) {
 }
 
 func (c *Commit) end() {
-	os.Remove(c.commit.Name())
+	c.commit.Truncate(0)
+	c.commit.Close()
 }
