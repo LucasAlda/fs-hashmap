@@ -24,7 +24,7 @@ func main() {
 	}
 	defer middleware.Close()
 
-	os.Mkdir("./database", 0777)
+	os.MkdirAll("./database/stats", 0777)
 
 	metrics := make(chan int)
 	go writeMetrics(metrics)
@@ -74,7 +74,7 @@ func updateStat(stat *middleware.Stats, tmpFile *os.File) {
 		stat.Negatives += cached.Negatives
 		stat.Positives += cached.Positives
 	} else {
-		file, err := os.Open(fmt.Sprintf("./database/%d/stat.csv", stat.AppId))
+		file, err := os.Open(fmt.Sprintf("./database/stats/%d.csv", stat.AppId))
 		if err == nil {
 			reader := csv.NewReader(file)
 
@@ -158,10 +158,10 @@ func getAlreadyProcessed() map[int]bool {
 func processStats(m *middleware.Middleware, metrics chan<- int) error {
 	alreadyProcessed := getAlreadyProcessed()
 
-	RestoreCommits(func(commit *Commit) {
+	RestoreCommit(func(commit *Commit) {
 		log.Printf("Restoring stat id: %s", commit.data[0][1])
 
-		err := os.Rename(commit.data[0][2], fmt.Sprintf("./database/%s/stat.csv", commit.data[0][0]))
+		err := os.Rename(commit.data[0][2], fmt.Sprintf("./database/stats/%s.csv", commit.data[0][0]))
 
 		if err != nil {
 			log.Printf("failed to rename file: %v", err)
@@ -210,14 +210,12 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 
 		metrics <- 1
 
-		os.MkdirAll(fmt.Sprintf("./database/%d", message.Stats.AppId), 0777)
-
 		if alreadyProcessed[message.Id] {
 			ack()
 			return nil
 		}
 
-		tmpFile, err := os.CreateTemp(fmt.Sprintf("./database/%d", message.Stats.AppId), "stat.csv")
+		tmpFile, err := os.CreateTemp("./database", fmt.Sprintf("%d.csv", message.Stats.AppId))
 		if err != nil {
 			log.Printf("failed to create temp file: %v", err)
 			return nil
@@ -234,7 +232,7 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 		updateProcessed(message.Id)
 		alreadyProcessed[message.Id] = true
 
-		os.Rename(tmpFile.Name(), fmt.Sprintf("./database/%d/stat.csv", message.Stats.AppId))
+		os.Rename(tmpFile.Name(), fmt.Sprintf("./database/stats/%d.csv", message.Stats.AppId))
 
 		commit.end()
 
@@ -247,7 +245,6 @@ func processStats(m *middleware.Middleware, metrics chan<- int) error {
 }
 
 type Commit struct {
-	path   string
 	commit *os.File
 	data   [][]string
 }
@@ -260,9 +257,7 @@ type Commit struct {
 // key,value
 // END
 func NewCommit(path string, data [][]string) *Commit {
-	os.MkdirAll("./database/commit", 0777)
-	// os.MkdirAll(fmt.Sprintf("./database/%s", path), 0777)
-	commit, err := os.Create(fmt.Sprintf("./database/commit/%s.csv", path))
+	commit, err := os.OpenFile("./database/commit.csv", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0777)
 	if err != nil {
 		log.Printf("failed to create commit file: %v", err)
 		return nil
@@ -273,35 +268,13 @@ func NewCommit(path string, data [][]string) *Commit {
 	writer.Write([]string{"END"})
 	writer.Flush()
 
-	return &Commit{path: path, commit: commit, data: data}
+	return &Commit{commit: commit, data: data}
 }
 
-func RestoreCommits(onCommit func(commit *Commit)) {
-	files, err := os.ReadDir("./database/commit/")
+func RestoreCommit(onCommit func(commit *Commit)) {
+	commitFile, err := os.Open("./database/commit.csv")
 	if err != nil {
-		return
-	}
-
-	for _, file := range files {
-		info, err := file.Info()
-		if err != nil {
-			log.Printf("failed to get file info: %v", err)
-			continue
-		}
-
-		if info.Size() == 0 {
-			continue
-		}
-
-		restoreCommit(file.Name(), onCommit)
-	}
-}
-
-func restoreCommit(path string, onCommit func(commit *Commit)) {
-	log.Printf("Restore commit: %s", path)
-	commitFile, err := os.Open(fmt.Sprintf("./database/commit/%s", path))
-	if err != nil {
-		log.Printf("failed to open commit file: %v", err)
+		log.Printf("No commit file found: %v", err)
 		return
 	}
 
@@ -315,21 +288,21 @@ func restoreCommit(path string, onCommit func(commit *Commit)) {
 	}
 
 	if len(data) == 0 {
-		log.Printf("empty commit file: %s", path)
+		log.Printf("Empty commit file")
 		return
 	}
 
 	if len(data[len(data)-1]) == 0 {
-		log.Printf("empty commit file (2): %s", path)
+		log.Printf("Empty commit file (2)")
 		return
 	}
 
 	if data[len(data)-1][0] != "END" {
-		log.Printf("empty commit file (3): %s", path)
+		log.Printf("Empty commit file (3)")
 		return
 	}
 
-	commit := &Commit{path: path, commit: commitFile, data: data[:len(data)-1]}
+	commit := &Commit{commit: commitFile, data: data[:len(data)-1]}
 
 	onCommit(commit)
 }
